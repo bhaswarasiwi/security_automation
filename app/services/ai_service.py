@@ -1,27 +1,18 @@
 """
 AI Service — provider bisa diganti via ENV atau endpoint /api/ai/switch
-Mendukung: Claude (Anthropic), OpenAI / OpenAI-compatible, Ollama (lokal)
+Mendukung: Gemini (Google), Claude (Anthropic), OpenAI / compatible, Ollama (lokal)
 
 CATATAN PENGGUNAAN TOKEN:
-- Setiap request ke AI dihitung dan dicatat di Supabase (tabel ai_usage_log)
-- Gunakan ai_max_tokens di config untuk batasi biaya
-- Gunakan ai_max_findings_per_call untuk batasi payload yang dikirim ke AI
-- Jika token hampir habis, fallback ke analisis rule-based otomatis
+- Gemini gratis: 1500 request/hari, 1 juta token/menit (gemini-2.0-flash)
+- Jika limit habis, fallback ke analisis rule-based otomatis
+- Pantau via GET /api/ai/usage
 """
 
 import httpx
 import json
-from typing import Optional
 from app.core.config import settings
 
-
-# ─── Usage Tracker ───────────────────────────────────────────────────────────
-
-_usage_session = {
-    "calls": 0,
-    "estimated_tokens": 0,
-    "provider": settings.ai_provider,
-}
+_usage_session = {"calls": 0, "estimated_tokens": 0, "provider": settings.ai_provider}
 
 def get_usage_stats() -> dict:
     return _usage_session.copy()
@@ -31,19 +22,15 @@ def reset_usage():
     _usage_session["estimated_tokens"] = 0
 
 
-# ─── Core AI call ────────────────────────────────────────────────────────────
-
 async def call_ai(prompt: str, system: str = "") -> str:
-    """
-    Panggil AI provider yang aktif.
-    Provider dipilih via settings.ai_provider (dari ENV).
-    """
     provider = settings.ai_provider
     _usage_session["calls"] += 1
-    _usage_session["estimated_tokens"] += len(prompt.split()) * 1.3  # estimasi kasar
+    _usage_session["estimated_tokens"] += int(len(prompt.split()) * 1.3)
 
     try:
-        if provider == "claude":
+        if provider == "gemini":
+            return await _call_gemini(prompt, system)
+        elif provider == "claude":
             return await _call_claude(prompt, system)
         elif provider == "openai":
             return await _call_openai(prompt, system)
@@ -52,8 +39,27 @@ async def call_ai(prompt: str, system: str = "") -> str:
         else:
             return _fallback_analysis(prompt)
     except Exception as e:
-        # Jika AI gagal / token habis — fallback ke analisis rule-based
         return _fallback_analysis(prompt, error=str(e))
+
+
+# ─── Gemini (Google AI Studio) ───────────────────────────────────────────────
+
+async def _call_gemini(prompt: str, system: str) -> str:
+    full_prompt = f"{system}\n\n{prompt}" if system else prompt
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{settings.gemini_model}:generateContent"
+        f"?key={settings.gemini_api_key}"
+    )
+    body = {
+        "contents": [{"parts": [{"text": full_prompt}]}],
+        "generationConfig": {"maxOutputTokens": settings.ai_max_tokens},
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, json=body)
+        r.raise_for_status()
+        data = r.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
 # ─── Claude (Anthropic) ──────────────────────────────────────────────────────
@@ -71,44 +77,28 @@ async def _call_claude(prompt: str, system: str) -> str:
     }
     if system:
         body["system"] = system
-
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
         r.raise_for_status()
-        data = r.json()
-        return data["content"][0]["text"]
+        return r.json()["content"][0]["text"]
 
 
-# ─── OpenAI / OpenAI-compatible (kantor, proxy, dll) ─────────────────────────
+# ─── OpenAI / OpenAI-compatible ──────────────────────────────────────────────
 
 async def _call_openai(prompt: str, system: str) -> str:
-    headers = {
-        "Authorization": f"Bearer {settings.openai_api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"}
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-
-    body = {
-        "model": settings.openai_model,
-        "max_tokens": settings.ai_max_tokens,
-        "messages": messages,
-    }
-
+    body = {"model": settings.openai_model, "max_tokens": settings.ai_max_tokens, "messages": messages}
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
-            f"{settings.openai_base_url}/chat/completions",
-            headers=headers,
-            json=body,
-        )
+        r = await client.post(f"{settings.openai_base_url}/chat/completions", headers=headers, json=body)
         r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"]
+        return r.json()["choices"][0]["message"]["content"]
 
 
-# ─── Ollama (lokal / self-hosted) ────────────────────────────────────────────
+# ─── Ollama (lokal) ──────────────────────────────────────────────────────────
 
 async def _call_ollama(prompt: str, system: str) -> str:
     body = {
@@ -123,31 +113,23 @@ async def _call_ollama(prompt: str, system: str) -> str:
         return r.json()["response"]
 
 
-# ─── Fallback rule-based (tidak butuh AI) ────────────────────────────────────
+# ─── Fallback rule-based ──────────────────────────────────────────────────────
 
 def _fallback_analysis(raw: str, error: str = "") -> str:
-    """
-    Analisis sederhana berbasis keyword jika AI tidak tersedia.
-    Digunakan saat: token habis, API down, atau mode offline.
-    """
     note = f"[FALLBACK — AI tidak tersedia: {error}]\n" if error else "[FALLBACK — mode analisis lokal]\n"
     severity = "info"
     findings = []
-
-    keywords_critical = ["rce", "remote code", "sql injection", "sqli", "authentication bypass"]
-    keywords_high     = ["xss", "ssrf", "idor", "broken auth", "open redirect"]
-    keywords_medium   = ["csrf", "information disclosure", "misconfiguration"]
-
     raw_lower = raw.lower()
-    for kw in keywords_critical:
+
+    for kw in ["rce", "remote code", "sql injection", "sqli", "authentication bypass"]:
         if kw in raw_lower:
             severity = "critical"
             findings.append(f"Terdeteksi pola kritis: {kw}")
-    for kw in keywords_high:
-        if kw in raw_lower and severity not in ["critical"]:
+    for kw in ["xss", "ssrf", "idor", "broken auth", "open redirect"]:
+        if kw in raw_lower and severity != "critical":
             severity = "high"
             findings.append(f"Terdeteksi pola tinggi: {kw}")
-    for kw in keywords_medium:
+    for kw in ["csrf", "information disclosure", "misconfiguration"]:
         if kw in raw_lower and severity not in ["critical", "high"]:
             severity = "medium"
             findings.append(f"Terdeteksi pola menengah: {kw}")
@@ -156,25 +138,17 @@ def _fallback_analysis(raw: str, error: str = "") -> str:
     return f"{note}Severity: {severity}\n{summary}"
 
 
-# ─── Triage hasil scan ───────────────────────────────────────────────────────
+# ─── Triage findings ─────────────────────────────────────────────────────────
 
 async def triage_findings(findings: list[dict]) -> dict:
-    """
-    Kirim hasil scan ke AI untuk triage.
-    Dibatasi ai_max_findings_per_call untuk hemat token.
-    """
-    limited = findings[: settings.ai_max_findings_per_call]
-
+    limited = findings[:settings.ai_max_findings_per_call]
     system = (
         "Kamu adalah security analyst yang menganalisis hasil bug bounty. "
         "Berikan triage singkat: severity, confidence, rekomendasi langkah berikutnya. "
         "Jawab dalam format JSON: {severity, confidence, summary, next_steps}."
     )
     prompt = f"Analisis temuan berikut:\n{json.dumps(limited, indent=2)}"
-
     raw = await call_ai(prompt, system)
-
-    # Coba parse JSON, fallback ke dict mentah
     try:
         clean = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
         return json.loads(clean)
