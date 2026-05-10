@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Bug Bounty Scanner",
+  "version": "1.0.0",
+  "description": "Trigger bug bounty scan langsung dari browser ke API kamu",
+  "permissions": ["activeTab", "storage", "contextMenus"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": { "48": "icon.png" }
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}

@@ -1,0 +1,51 @@
+# ─── Python ─────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+
+# ─── Virtual environment ─────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+
+# ─── Secrets — JANGAN pernah commit ini ─────────────────────────
+.env
+.env.local
+.env.production
+*.key
+secrets.json
+
+# ─── IDE ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ─── Log & output ────────────────────────────────────────────────
+*.log
+logs/
+output/
+tmp/
+
+# ─── Tools binary (diinstall saat build) ─────────────────────────
+tools/
+/opt/render/project/tools/
+
+# ─── ZIP / archive ───────────────────────────────────────────────
+*.zip
+*.tar.gz

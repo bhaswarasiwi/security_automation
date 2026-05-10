@@ -1,0 +1,50 @@
+# render.yaml — Deploy config untuk Render.com
+# Letakkan file ini di root repository
+
+services:
+  - type: web
+    name: bugbounty-api
+    runtime: python
+    region: singapore  # paling dekat Indonesia
+    plan: free         # ganti ke starter ($7) jika butuh lebih dari 512MB RAM
+
+    buildCommand: |
+      pip install -r requirements.txt
+      bash scripts/install_tools.sh
+
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+    envVars:
+      # ── Supabase ──
+      - key: SUPABASE_URL
+        sync: false   # isi manual di Render dashboard
+      - key: SUPABASE_KEY
+        sync: false
+
+      # ── AI Provider (default Claude, bisa diganti runtime) ──
+      - key: AI_PROVIDER
+        value: claude
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: CLAUDE_MODEL
+        value: claude-sonnet-4-20250514
+
+      # ── OpenAI / proxy kantor (opsional) ──
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o
+      - key: OPENAI_BASE_URL
+        value: https://api.openai.com/v1
+
+      # ── Batas penggunaan AI ──
+      - key: AI_MAX_TOKENS
+        value: "1000"
+      - key: AI_MAX_FINDINGS_PER_CALL
+        value: "10"
+
+      # ── App ──
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: "false"

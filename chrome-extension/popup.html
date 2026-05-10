@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bug Bounty Scanner</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, sans-serif; }
+  body { width: 340px; background: #0f0f11; color: #e2e2e2; padding: 16px; }
+  h1 { font-size: 14px; font-weight: 600; color: #a78bfa; margin-bottom: 12px; }
+  .url-bar { background: #1a1a20; border: 1px solid #2d2d38; border-radius: 8px;
+             padding: 10px 12px; font-size: 12px; color: #9ca3af; margin-bottom: 12px;
+             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .section { margin-bottom: 12px; }
+  label { font-size: 11px; color: #6b7280; display: block; margin-bottom: 4px; }
+  input, select { width: 100%; background: #1a1a20; border: 1px solid #2d2d38;
+                  border-radius: 6px; padding: 8px 10px; font-size: 12px; color: #e2e2e2;
+                  outline: none; }
+  input:focus, select:focus { border-color: #7c3aed; }
+  .row { display: flex; gap: 8px; }
+  .row .section { flex: 1; }
+  button { width: 100%; padding: 10px; border-radius: 8px; border: none; cursor: pointer;
+           font-size: 13px; font-weight: 600; transition: opacity 0.2s; }
+  #btn-scan { background: #7c3aed; color: white; margin-bottom: 8px; }
+  #btn-scan:hover { opacity: 0.85; }
+  #btn-scan:disabled { opacity: 0.4; cursor: not-allowed; }
+  #btn-status { background: #1a1a20; color: #a78bfa; border: 1px solid #2d2d38; }
+  .status-box { background: #1a1a20; border-radius: 8px; padding: 10px 12px;
+                font-size: 11px; margin-top: 10px; line-height: 1.6; min-height: 48px;
+                border: 1px solid #2d2d38; color: #9ca3af; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 99px;
+           font-size: 10px; font-weight: 600; margin-left: 4px; }
+  .badge-ok    { background: #14532d; color: #86efac; }
+  .badge-warn  { background: #78350f; color: #fcd34d; }
+  .badge-err   { background: #7f1d1d; color: #fca5a5; }
+  .badge-run   { background: #1e3a5f; color: #93c5fd; }
+  .link { color: #7c3aed; text-decoration: none; font-size: 11px; }
+  .settings-row { display: flex; align-items: center; justify-content: space-between;
+                  margin-top: 10px; }
+  .settings-row a { color: #6b7280; font-size: 10px; }
+  #provider-badge { font-size: 10px; color: #6b7280; }
+</style>
+</head>
+<body>
+<h1>🦞 Bug Bounty Scanner</h1>
+
+<div class="url-bar" id="current-url">Memuat URL...</div>
+
+<div class="row">
+  <div class="section">
+    <label>Jenis target</label>
+    <select id="target-type">
+      <option value="web">Web</option>
+      <option value="api">API</option>
+      <option value="network">Network</option>
+    </select>
+  </div>
+  <div class="section">
+    <label>Severity filter</label>
+    <select id="severity">
+      <option value="medium,high,critical">Medium+</option>
+      <option value="high,critical">High+</option>
+      <option value="critical">Critical only</option>
+      <option value="info,low,medium,high,critical">Semua</option>
+    </select>
+  </div>
+</div>
+
+<div class="section">
+  <label>AI triage</label>
+  <select id="use-ai">
+    <option value="true">Ya (pakai token)</option>
+    <option value="false">Tidak (hemat token)</option>
+  </select>
+</div>
+
+<button id="btn-scan">⚡ Mulai Scan</button>
+<button id="btn-status">🔄 Cek Status Terakhir</button>
+
+<div class="status-box" id="status-box">Siap untuk scan...</div>
+
+<div class="settings-row">
+  <a href="#" id="open-options">⚙ Settings API URL</a>
+  <span id="provider-badge">provider: —</span>
+</div>
+
+<script src="popup.js"></script>
+</body>
+</html>
