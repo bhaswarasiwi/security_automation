@@ -1,8 +1,6 @@
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import JSONResponse
 from app.core.supabase import get_supabase
-from app.services.ai_service import call_ai, get_usage_stats
-import json
+from app.services.ai_service import generate_ai_report_summary, get_usage_stats
 
 router = APIRouter()
 
@@ -11,17 +9,19 @@ router = APIRouter()
 async def generate_report(session_id: str, use_ai: bool = True):
     """
     Generate laporan hasil scan.
-    use_ai=True  → AI buat ringkasan naratif (butuh token)
-    use_ai=False → Laporan struktural tanpa AI (gratis)
+
+    use_ai=True  → AI buat ringkasan naratif (data sensitif otomatis di-strip sebelum dikirim)
+    use_ai=False → Laporan struktural tanpa AI, semua data asli tersedia untuk review internal
     """
     db = get_supabase()
 
-    session = db.table("scan_session").select("*, target(nama, base_url)").eq("id", session_id).single().execute()
+    session = db.table("scan_session").select("*, target(nama, base_url, jenis)").eq("id", session_id).single().execute()
     if not session.data:
         raise HTTPException(404, "Session tidak ditemukan")
 
     results = db.table("test_result").select("*").eq("session_id", session_id).execute()
 
+    # Grouping per severity — data LENGKAP untuk laporan internal
     by_severity: dict = {}
     for r in results.data:
         sev = r.get("severity") or "unknown"
@@ -33,19 +33,19 @@ async def generate_report(session_id: str, use_ai: bool = True):
         "status": session.data.get("status"),
         "started_at": session.data.get("started_at"),
         "finished_at": session.data.get("finished_at"),
-        "findings_by_severity": by_severity,
+        "findings_by_severity": by_severity,   # data lengkap — hanya untuk internal
         "total_findings": len(results.data),
         "ai_summary": None,
+        "data_privacy_note": (
+            "Data sensitif (IP, URL, token, credential) tidak dikirim ke AI. "
+            "AI hanya menerima pola vulnerability untuk triage."
+        ),
     }
 
     if use_ai and results.data:
-        prompt = (
-            f"Buat ringkasan eksekutif bug bounty report untuk target: "
-            f"{session.data.get('target', {}).get('base_url', '')}.\n"
-            f"Temuan:\n{json.dumps(by_severity, indent=2)}\n"
-            "Format: paragraf singkat, highlight risiko tertinggi, rekomendasi remediasi."
-        )
-        report["ai_summary"] = await call_ai(prompt)
+        target_info = session.data.get("target", {})
+        # generate_ai_report_summary sudah sanitasi otomatis di dalam
+        report["ai_summary"] = await generate_ai_report_summary(target_info, by_severity)
         report["ai_usage"] = get_usage_stats()
 
     return report
