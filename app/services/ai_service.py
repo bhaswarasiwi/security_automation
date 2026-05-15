@@ -1,204 +1,199 @@
 """
-AI Service — provider bisa diganti via ENV atau endpoint /api/ai/switch
-Mendukung: Gemini (Google), Claude (Anthropic), OpenAI / compatible, Ollama (lokal)
+app/services/ai_service.py (PATCHED — tambah Gemini adapter)
+------------------------------------------------------------
+AI provider yang di-support:
+  - claude    : Anthropic Claude via anthropic SDK
+  - openai    : OpenAI atau compatible endpoint (OpenRouter, Azure, etc.)
+  - gemini    : Google Gemini via google-generativeai SDK  ← BARU
+  - ollama    : Ollama lokal (OpenAI-compatible endpoint)
 
-KEAMANAN DATA:
-- Semua findings di-sanitasi via sanitizer.py sebelum dikirim ke AI
-- Data sensitif (IP, URL, token, cookie, credential) tidak pernah meninggalkan sistem
-- AI hanya menerima pola & kategori vulnerability — cukup untuk triage
-- Data asli tersimpan utuh di Supabase raw_output
+Set di .env / Render Dashboard:
+  AI_PROVIDER=gemini
+  GEMINI_API_KEY=AIza...
+  GEMINI_MODEL=gemini-2.0-flash   (default)
 
-CATATAN PENGGUNAAN TOKEN:
-- Gemini gratis: 1.500 request/hari, 1 juta token/menit (gemini-2.0-flash)
-- Pantau via GET /api/ai/usage
-- Jika limit habis, fallback ke analisis rule-based otomatis (tanpa AI)
+Install tambahan di requirements.txt:
+  google-generativeai>=0.8.0
 """
 
-import httpx
-import json
-from app.core.config import settings
-from app.services.sanitizer import sanitize_findings_for_ai, sanitize_report_summary
+from __future__ import annotations
 
-_usage_session = {"calls": 0, "estimated_tokens": 0, "provider": settings.ai_provider}
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Any
 
-def get_usage_stats() -> dict:
-    return _usage_session.copy()
-
-def reset_usage():
-    _usage_session["calls"] = 0
-    _usage_session["estimated_tokens"] = 0
+logger = logging.getLogger(__name__)
 
 
-async def call_ai(prompt: str, system: str = "") -> str:
-    """Panggil AI provider aktif. Prompt sudah harus bersih sebelum masuk sini."""
-    provider = settings.ai_provider
-    _usage_session["calls"] += 1
-    _usage_session["estimated_tokens"] += int(len(prompt.split()) * 1.3)
+# ─── Config ───────────────────────────────────────────────────────────────────
 
+@dataclass
+class AIConfig:
+    provider:  str = "gemini"
+    api_key:   str | None = None
+    base_url:  str | None = None
+    model:     str | None = None
+    max_tokens: int = 1000
+
+    @classmethod
+    def from_env(cls) -> "AIConfig":
+        provider = os.environ.get("AI_PROVIDER", "gemini").lower()
+
+        return cls(
+            provider   = provider,
+            api_key    = os.environ.get(f"{provider.upper()}_API_KEY") or os.environ.get("AI_API_KEY"),
+            base_url   = os.environ.get("AI_BASE_URL"),
+            model      = os.environ.get("AI_MODEL"),
+            max_tokens = int(os.environ.get("AI_MAX_TOKENS", "1000")),
+        )
+
+
+# ─── Singleton runtime config (bisa di-swap via /api/ai/switch) ──────────────
+
+_current_config: AIConfig = AIConfig.from_env()
+
+
+def get_ai_config() -> AIConfig:
+    return _current_config
+
+
+def set_ai_config(config: AIConfig) -> None:
+    global _current_config
+    _current_config = config
+    logger.info("AI provider switched to: %s (model: %s)", config.provider, config.model)
+
+
+# ─── Provider adapters ────────────────────────────────────────────────────────
+
+def _call_gemini(prompt: str, config: AIConfig) -> str:
+    """
+    Gemini adapter via google-generativeai SDK.
+    Gemini API tidak compatible dengan OpenAI format — butuh SDK sendiri.
+    """
     try:
-        if provider == "gemini":
-            return await _call_gemini(prompt, system)
-        elif provider == "claude":
-            return await _call_claude(prompt, system)
-        elif provider == "openai":
-            return await _call_openai(prompt, system)
-        elif provider == "ollama":
-            return await _call_ollama(prompt, system)
-        else:
-            return _fallback_analysis(prompt)
-    except Exception as e:
-        return _fallback_analysis(prompt, error=str(e))
+        import google.generativeai as genai
+    except ImportError:
+        raise RuntimeError(
+            "google-generativeai belum terinstall. "
+            "Tambahkan 'google-generativeai>=0.8.0' ke requirements.txt"
+        )
 
+    api_key = config.api_key or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY tidak ditemukan di environment.")
 
-# ─── Gemini ──────────────────────────────────────────────────────────────────
+    genai.configure(api_key=api_key)
 
-async def _call_gemini(prompt: str, system: str) -> str:
-    full_prompt = f"{system}\n\n{prompt}" if system else prompt
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{settings.gemini_model}:generateContent"
-        f"?key={settings.gemini_api_key}"
+    model_name = config.model or os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    model = genai.GenerativeModel(
+        model_name       = model_name,
+        generation_config = genai.types.GenerationConfig(
+            max_output_tokens = config.max_tokens,
+            temperature       = 0.3,   # Rendah untuk output analitik yang konsisten
+        ),
     )
-    body = {
-        "contents": [{"parts": [{"text": full_prompt}]}],
-        "generationConfig": {"maxOutputTokens": settings.ai_max_tokens},
-    }
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, json=body)
-        r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+    response = model.generate_content(prompt)
+    return response.text
 
 
-# ─── Claude ──────────────────────────────────────────────────────────────────
-
-async def _call_claude(prompt: str, system: str) -> str:
-    headers = {
-        "x-api-key": settings.anthropic_api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    body = {
-        "model": settings.claude_model,
-        "max_tokens": settings.ai_max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    if system:
-        body["system"] = system
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
-        r.raise_for_status()
-        return r.json()["content"][0]["text"]
-
-
-# ─── OpenAI / compatible ─────────────────────────────────────────────────────
-
-async def _call_openai(prompt: str, system: str) -> str:
-    headers = {
-        "Authorization": f"Bearer {settings.openai_api_key}",
-        "Content-Type": "application/json",
-    }
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-    body = {
-        "model": settings.openai_model,
-        "max_tokens": settings.ai_max_tokens,
-        "messages": messages,
-    }
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(f"{settings.openai_base_url}/chat/completions", headers=headers, json=body)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
-
-
-# ─── Ollama ──────────────────────────────────────────────────────────────────
-
-async def _call_ollama(prompt: str, system: str) -> str:
-    body = {
-        "model": settings.ollama_model,
-        "prompt": f"{system}\n\n{prompt}" if system else prompt,
-        "stream": False,
-        "options": {"num_predict": settings.ai_max_tokens},
-    }
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(f"{settings.ollama_base_url}/api/generate", json=body)
-        r.raise_for_status()
-        return r.json()["response"]
-
-
-# ─── Fallback rule-based (tanpa AI) ──────────────────────────────────────────
-
-def _fallback_analysis(raw: str, error: str = "") -> str:
-    note = f"[FALLBACK — AI tidak tersedia: {error}]\n" if error else "[FALLBACK — mode analisis lokal]\n"
-    severity = "info"
-    findings = []
-    raw_lower = raw.lower()
-
-    for kw in ["rce", "remote code", "sql injection", "sqli", "authentication bypass"]:
-        if kw in raw_lower:
-            severity = "critical"
-            findings.append(f"Terdeteksi pola kritis: {kw}")
-    for kw in ["xss", "ssrf", "idor", "broken auth", "open redirect"]:
-        if kw in raw_lower and severity != "critical":
-            severity = "high"
-            findings.append(f"Terdeteksi pola tinggi: {kw}")
-    for kw in ["csrf", "information disclosure", "misconfiguration"]:
-        if kw in raw_lower and severity not in ["critical", "high"]:
-            severity = "medium"
-            findings.append(f"Terdeteksi pola menengah: {kw}")
-
-    summary = "\n".join(findings) if findings else "Tidak ada pola vulnerability yang ditemukan."
-    return f"{note}Severity: {severity}\n{summary}"
-
-
-# ─── Triage findings (dengan sanitasi otomatis) ───────────────────────────────
-
-async def triage_findings(findings: list[dict]) -> dict:
-    """
-    Sanitasi findings dulu, baru kirim ke AI.
-    Data sensitif (IP, URL, token, dll) tidak pernah dikirim ke AI.
-    """
-    # 1. Batasi jumlah
-    limited = findings[:settings.ai_max_findings_per_call]
-
-    # 2. SANITASI — hapus semua data sensitif sebelum kirim ke AI
-    safe_findings = sanitize_findings_for_ai(limited)
-
-    system = (
-        "Kamu adalah security analyst yang menganalisis hasil bug bounty. "
-        "Data yang kamu terima sudah dianonimkan — jangan minta data asli. "
-        "Berikan triage berdasarkan pola vulnerability saja. "
-        "Jawab dalam format JSON: {severity, confidence, summary, next_steps}."
-    )
-    prompt = f"Analisis pola vulnerability berikut:\n{json.dumps(safe_findings, indent=2)}"
-
-    raw = await call_ai(prompt, system)
+def _call_claude(prompt: str, config: AIConfig) -> str:
+    """Anthropic Claude adapter."""
     try:
-        clean = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-        return json.loads(clean)
-    except Exception:
-        return {"summary": raw, "severity": "unknown", "confidence": "low", "next_steps": []}
+        import anthropic
+    except ImportError:
+        raise RuntimeError("anthropic belum terinstall. Tambahkan 'anthropic>=0.28.0'.")
 
-
-# ─── Report summary (dengan sanitasi otomatis) ────────────────────────────────
-
-async def generate_ai_report_summary(target_info: dict, by_severity: dict) -> str:
-    """
-    Generate ringkasan laporan. Target info & findings di-sanitasi dulu.
-    """
-    # Sanitasi — hanya kirim nama target (bukan URL/IP asli)
-    safe_target = {
-        "nama": target_info.get("nama", "Target"),
-        "jenis": target_info.get("jenis", "web"),
-    }
-    safe_findings = sanitize_report_summary(by_severity)
-
-    prompt = (
-        f"Buat ringkasan eksekutif bug bounty report untuk target: {safe_target['nama']} "
-        f"(tipe: {safe_target['jenis']}).\n"
-        f"Temuan per severity:\n{json.dumps(safe_findings, indent=2)}\n"
-        "Format: paragraf singkat, highlight risiko tertinggi, rekomendasi remediasi. "
-        "Jangan sebut URL atau IP spesifik."
+    client = anthropic.Anthropic(api_key=config.api_key or os.environ.get("ANTHROPIC_API_KEY"))
+    message = client.messages.create(
+        model      = config.model or "claude-3-5-haiku-latest",
+        max_tokens = config.max_tokens,
+        messages   = [{"role": "user", "content": prompt}],
     )
-    return await call_ai(prompt)
+    return message.content[0].text
+
+
+def _call_openai_compatible(prompt: str, config: AIConfig) -> str:
+    """OpenAI-compatible endpoint (OpenAI, Ollama, OpenRouter, dll)."""
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise RuntimeError("openai belum terinstall. Tambahkan 'openai>=1.0.0'.")
+
+    client_kwargs: dict[str, Any] = {
+        "api_key": config.api_key or "ollama",  # Ollama tidak butuh key valid
+    }
+    if config.base_url:
+        client_kwargs["base_url"] = config.base_url
+    elif config.provider == "ollama":
+        client_kwargs["base_url"] = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+
+    client = OpenAI(**client_kwargs)
+    response = client.chat.completions.create(
+        model      = config.model or ("llama3" if config.provider == "ollama" else "gpt-4o-mini"),
+        messages   = [{"role": "user", "content": prompt}],
+        max_tokens = config.max_tokens,
+    )
+    return response.choices[0].message.content or ""
+
+
+# ─── Public interface ─────────────────────────────────────────────────────────
+
+def call_ai(prompt: str, config: AIConfig | None = None) -> str:
+    """
+    Panggil AI provider sesuai konfigurasi aktif.
+    Ini adalah satu-satunya function yang perlu dipanggil dari luar.
+
+    Args:
+        prompt: Prompt lengkap untuk AI
+        config: Override config (default: pakai config aktif global)
+
+    Returns:
+        Teks response dari AI
+    """
+    cfg = config or get_ai_config()
+
+    logger.info("Calling AI: provider=%s, model=%s", cfg.provider, cfg.model)
+
+    dispatch = {
+        "gemini":  _call_gemini,
+        "claude":  _call_claude,
+        "openai":  _call_openai_compatible,
+        "ollama":  _call_openai_compatible,
+    }
+
+    handler = dispatch.get(cfg.provider)
+    if not handler:
+        raise ValueError(
+            f"AI provider '{cfg.provider}' tidak didukung. "
+            f"Pilihan: {list(dispatch.keys())}"
+        )
+
+    return handler(prompt, cfg)
+
+
+def build_triage_prompt(findings: list[dict]) -> str:
+    """
+    Build prompt untuk AI triage dari list findings.
+    Dipakai di report router.
+    """
+    findings_text = "\n".join([
+        f"- [{f.get('severity', '?').upper()}] {f.get('method', '-')}: {f.get('finding', '-')}"
+        for f in findings
+    ])
+
+    return f"""Kamu adalah security analyst expert. Analisis temuan vulnerability scan berikut dan berikan:
+
+1. **Ringkasan eksekutif** (2-3 kalimat)
+2. **3 temuan paling kritis** yang perlu segera diperbaiki
+3. **Rekomendasi perbaikan** untuk setiap temuan kritis
+4. **Risk score** keseluruhan (0-10) dengan justifikasi singkat
+
+Gunakan bahasa Indonesia yang profesional. Format response dalam Markdown.
+
+=== HASIL SCAN ===
+{findings_text}
+=================
+
+Berikan analisis yang actionable dan to-the-point."""

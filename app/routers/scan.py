@@ -1,95 +1,128 @@
-from fastapi import APIRouter, BackgroundTasks, HTTPException
-from pydantic import BaseModel
-import uuid
-from datetime import datetime, timezone
-from app.core.supabase import get_supabase
-from app.services.scan_service import run_full_scan
-from app.services.ai_service import triage_findings, get_usage_stats
+"""
+app/routers/scan.py (PATCHED — multi-tenant)
+--------------------------------------------
+Perubahan dari versi lama:
+- Wajib login
+- create_session inject user_id
+- Status check verifikasi kepemilikan session
+"""
 
-router = APIRouter()
+from __future__ import annotations
+
+import logging
+
+from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
+
+from app.agent.runner import ScanConfig
+from app.agent.async_runner import AsyncAgentRunner
+from app.agent.repository import ScanRepository
+from app.api.dependencies import get_repository
+from app.api.schemas import ScanRequest, MessageResponse
+from app.api.ws_manager import ws_manager
+from app.core.auth import CurrentUser
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/scan", tags=["Scan"])
 
 
-class ScanRequest(BaseModel):
-    target_id: str
-    session_name: str = ""
-    severity_filter: str = "medium,high,critical"  # filter nuclei
-    use_ai_triage: bool = True
+async def _run_scan_background(
+    config: ScanConfig,
+    session_id: str,
+) -> None:
+    runner = AsyncAgentRunner()
+
+    async def push(event: str, data: dict) -> None:
+        await ws_manager.push(session_id, event, data)
+
+    try:
+        await runner.run(config=config, session_id=session_id, ws_push=push)
+    except Exception as e:
+        logger.error("Background scan error: %s", e, exc_info=True)
 
 
-@router.post("/start")
-async def start_scan(body: ScanRequest, bg: BackgroundTasks):
+@router.post("", response_model=MessageResponse, status_code=202)
+async def run_scan(
+    body: ScanRequest,
+    background_tasks: BackgroundTasks,
+    current_user: CurrentUser,
+    repo: ScanRepository = Depends(get_repository),
+):
     """
-    Mulai scan otomatis: subfinder → httpx → nuclei.
-    Berjalan sebagai background task, langsung return session_id.
+    Jalankan scan baru (202 Accepted — scan jalan di background).
+    Subscribe /ws/{session_id} untuk live progress.
     """
-    db = get_supabase()
+    # Resolve dan validasi target
+    if body.target_id:
+        # Verifikasi kepemilikan target
+        target = repo.get_target(body.target_id, user_id=current_user.user_id)
+        if not target:
+            raise HTTPException(status_code=404, detail="Target tidak ditemukan.")
+        target_id = body.target_id
+        base_url  = target["base_url"]
+    else:
+        # Auto-create target untuk manual URL, langsung assign ke user
+        from urllib.parse import urlparse
+        hostname = urlparse(body.manual_url).hostname or body.manual_url
+        target = repo.create_target(
+            nama      = f"[Manual] {hostname}",
+            jenis     = "web",
+            base_url  = body.manual_url,
+            deskripsi = "Auto-created dari manual URL input.",
+            user_id   = current_user.user_id,   # ← assign ke user
+        )
+        target_id = target["id"]
+        base_url  = body.manual_url
 
-    # Ambil data target
-    target = db.table("target").select("*").eq("id", body.target_id).single().execute()
-    if not target.data:
-        raise HTTPException(404, "Target tidak ditemukan")
+    # Buat session dengan user_id
+    session = repo.create_session(
+        target_id  = target_id,
+        user_id    = current_user.user_id,    # ← inject user_id
+        nama       = body.session_nama or f"Scan — {base_url}",
+    )
+    session_id = session["id"]
 
-    # Ambil method_id default (atau bisa dikirim dari client)
-    method = db.table("hack_methods").select("id").eq("is_active", True).limit(1).execute()
-    method_id = method.data[0]["id"] if method.data else str(uuid.uuid4())
-
-    # Buat scan session baru
-    session_id = str(uuid.uuid4())
-    db.table("scan_session").insert({
-        "id": session_id,
-        "target_id": body.target_id,
-        "nama": body.session_name or f"Scan {target.data['nama']} {datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}",
-        "status": "pending",
-    }).execute()
-
-    # Jalankan scan di background
-    bg.add_task(
-        run_full_scan,
-        session_id=session_id,
-        target_id=body.target_id,
-        base_url=target.data["base_url"],
-        method_id=method_id,
+    config = ScanConfig(
+        target_id      = target_id,
+        execution_mode = body.execution_mode,
+        timeout        = body.timeout,
+        session_nama   = body.session_nama,
     )
 
-    return {
-        "session_id": session_id,
-        "status": "pending",
-        "message": "Scan dimulai, pantau via GET /api/scan/status/{session_id}",
+    background_tasks.add_task(
+        _run_scan_background,
+        config     = config,
+        session_id = session_id,
+    )
+
+    return MessageResponse(
+        message = "Scan dimulai. Subscribe ke WebSocket untuk live progress.",
+        data    = {
+            "session_id": session_id,
+            "target_url": base_url,
+            "ws_url":     f"/ws/{session_id}",
+        }
+    )
+
+
+@router.get("/{session_id}/status", response_model=MessageResponse)
+def get_scan_status(
+    session_id: str,
+    current_user: CurrentUser,
+    repo: ScanRepository = Depends(get_repository),
+):
+    """Cek status scan. Hanya milik user sendiri."""
+    session = repo.get_session(session_id, user_id=current_user.user_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session tidak ditemukan.")
+
+    data = {
+        "session_id":  session_id,
+        "status":      session["status"],
+        "started_at":  session.get("started_at"),
+        "finished_at": session.get("finished_at"),
     }
 
+    if session["status"] in ("completed", "failed"):
+        data["summary"] = repo.get_summary_by_session(session_id)
 
-@router.get("/status/{session_id}")
-async def get_scan_status(session_id: str):
-    """Cek status scan session + jumlah temuan saat ini."""
-    db = get_supabase()
-    session = db.table("scan_session").select("*").eq("id", session_id).single().execute()
-    if not session.data:
-        raise HTTPException(404, "Session tidak ditemukan")
-
-    count = db.table("test_result").select("id", count="exact").eq("session_id", session_id).execute()
-
-    return {
-        **session.data,
-        "total_findings": count.count or 0,
-    }
-
-
-@router.post("/triage/{session_id}")
-async def triage_session(session_id: str):
-    """
-    Kirim temuan session ke AI untuk triage.
-    Mematuhi batas ai_max_findings_per_call dari config.
-    """
-    db = get_supabase()
-    results = db.table("test_result").select("*").eq("session_id", session_id).execute()
-    if not results.data:
-        raise HTTPException(404, "Belum ada temuan untuk session ini")
-
-    triage = await triage_findings(results.data)
-    usage  = get_usage_stats()
-
-    return {
-        "session_id": session_id,
-        "triage": triage,
-        "ai_usage": usage,
-    }
+    return MessageResponse(message="OK", data=data)

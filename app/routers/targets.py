@@ -1,73 +1,113 @@
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from typing import Optional, Literal
-import uuid
-from datetime import datetime, timezone
-from app.core.supabase import get_supabase
+"""
+app/routers/targets.py (PATCHED — multi-tenant)
+------------------------------------------------
+Perubahan dari versi lama:
+- Semua endpoint wajib login via Depends(get_current_user)
+- create_target otomatis inject user_id dari JWT
+- list/get/delete hanya return data milik user yang sedang login
+- Operasi ke user lain → 404 (bukan 403, agar tidak expose keberadaan resource)
+"""
 
-router = APIRouter()
+from __future__ import annotations
 
+from fastapi import APIRouter, Depends, HTTPException
 
-class TargetCreate(BaseModel):
-    nama: str
-    jenis: Literal["web", "api", "mobile", "network", "other"]
-    base_url: str
-    deskripsi: Optional[str] = None
+from app.agent.repository import ScanRepository
+from app.api.dependencies import get_repository
+from app.api.schemas import (
+    TargetCreate, EndpointCreate, MessageResponse,
+)
+from app.core.auth import CurrentUser
 
-
-class EndpointCreate(BaseModel):
-    target_id: str
-    path: str
-    method: Literal["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"] = "GET"
-    deskripsi: Optional[str] = None
-
-
-@router.get("/")
-def list_targets():
-    db = get_supabase()
-    res = db.table("target").select("*").eq("is_active", True).order("created_at", desc=True).execute()
-    return res.data
+router = APIRouter(prefix="/api/targets", tags=["Targets"])
 
 
-@router.post("/")
-def create_target(body: TargetCreate):
-    db = get_supabase()
-    now = datetime.now(timezone.utc).isoformat()
-    res = db.table("target").insert({
-        "id": str(uuid.uuid4()),
-        "nama": body.nama,
-        "jenis": body.jenis,
-        "base_url": body.base_url,
-        "deskripsi": body.deskripsi,
-        "is_active": True,
-        "created_at": now,
-        "updated_at": now,
-    }).execute()
-    return res.data[0]
+@router.post("", response_model=MessageResponse, status_code=201)
+def create_target(
+    body: TargetCreate,
+    current_user: CurrentUser,
+    repo: ScanRepository = Depends(get_repository),
+):
+    """Buat target baru. user_id otomatis dari JWT."""
+    target = repo.create_target(
+        nama      = body.nama,
+        jenis     = body.jenis,
+        base_url  = body.base_url,
+        deskripsi = body.deskripsi,
+        user_id   = current_user.user_id,  # ← inject dari auth
+    )
+    return MessageResponse(message="Target berhasil dibuat.", data=target)
 
 
-@router.delete("/{target_id}")
-def deactivate_target(target_id: str):
-    db = get_supabase()
-    db.table("target").update({"is_active": False}).eq("id", target_id).execute()
-    return {"message": "Target dinonaktifkan"}
+@router.get("", response_model=MessageResponse)
+def list_targets(
+    current_user: CurrentUser,
+    repo: ScanRepository = Depends(get_repository),
+):
+    """List semua target aktif milik user yang sedang login."""
+    result = (
+        repo.sb.table("target")
+        .select("id, nama, jenis, base_url, deskripsi, is_active, created_at")
+        .eq("user_id", current_user.user_id)   # ← filter by user
+        .eq("is_active", True)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return MessageResponse(message="OK", data=result.data)
 
 
-@router.post("/endpoints")
-def add_endpoint(body: EndpointCreate):
-    db = get_supabase()
-    res = db.table("target_endpoint").insert({
-        "id": str(uuid.uuid4()),
-        "target_id": body.target_id,
-        "path": body.path,
-        "method": body.method,
-        "deskripsi": body.deskripsi,
-    }).execute()
-    return res.data[0]
+@router.get("/{target_id}", response_model=MessageResponse)
+def get_target(
+    target_id: str,
+    current_user: CurrentUser,
+    repo: ScanRepository = Depends(get_repository),
+):
+    """Detail satu target beserta endpoint-nya. Hanya milik user sendiri."""
+    target = repo.get_target(target_id, user_id=current_user.user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Target tidak ditemukan.")
+
+    endpoints = repo.get_target_endpoints(target_id)
+    target["endpoints"] = endpoints
+    return MessageResponse(message="OK", data=target)
 
 
-@router.get("/{target_id}/endpoints")
-def list_endpoints(target_id: str):
-    db = get_supabase()
-    res = db.table("target_endpoint").select("*").eq("target_id", target_id).execute()
-    return res.data
+@router.delete("/{target_id}", response_model=MessageResponse)
+def delete_target(
+    target_id: str,
+    current_user: CurrentUser,
+    repo: ScanRepository = Depends(get_repository),
+):
+    """Soft delete target (set is_active=False). Hanya milik user sendiri."""
+    target = repo.get_target(target_id, user_id=current_user.user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Target tidak ditemukan.")
+
+    repo.sb.table("target").update({"is_active": False}).eq("id", target_id).execute()
+    return MessageResponse(message="Target berhasil dihapus.", data={"id": target_id})
+
+
+@router.post("/{target_id}/endpoints", response_model=MessageResponse, status_code=201)
+def add_endpoint(
+    target_id: str,
+    body: EndpointCreate,
+    current_user: CurrentUser,
+    repo: ScanRepository = Depends(get_repository),
+):
+    """Tambah endpoint ke target. Verifikasi kepemilikan target dulu."""
+    # Pastikan target ini milik user yang sedang login
+    target = repo.get_target(target_id, user_id=current_user.user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Target tidak ditemukan.")
+
+    result = (
+        repo.sb.table("target_endpoint")
+        .insert({
+            "target_id": target_id,
+            "path":      body.path,
+            "method":    body.method,
+            "deskripsi": body.deskripsi,
+        })
+        .execute()
+    )
+    return MessageResponse(message="Endpoint berhasil ditambahkan.", data=result.data[0])
