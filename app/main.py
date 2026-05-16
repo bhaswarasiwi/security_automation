@@ -1,76 +1,57 @@
 """
-app/main.py (PATCHED)
----------------------
+app/main.py
+-----------
+Entry point FastAPI.
+
 Perubahan dari versi lama:
-1. CORS: tambah Vercel production domain
-2. CORS: baca dari ENV agar fleksibel per environment
-3. Semua router sudah siap terima Depends(get_current_user)
+  - CORS baca dari ENV (ALLOWED_ORIGINS)
+  - /docs, /redoc, /openapi.json dikunci di production (ENVIRONMENT=production)
+  - Semua router sudah siap dengan auth middleware
 """
 
 from __future__ import annotations
 
-import os
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import targets, scan, sessions, methods, results, report, ai_config
+from app.core.config import get_settings
+from app.routers import ai_config, report, results, scan, targets
+
+settings = get_settings()
 
 app = FastAPI(
-    title="Security Automation API",
-    description="Agentic Security Tools — FastAPI + Supabase + AI",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    title       = "Bug Bounty Automation API",
+    description = "FastAPI + Supabase + AI — Agentic Security Automation",
+    version     = "2.0.0",
+    # Kunci docs di production agar attack surface tidak terekspos
+    docs_url    = None if settings.is_production else "/docs",
+    redoc_url   = None if settings.is_production else "/redoc",
+    openapi_url = None if settings.is_production else "/openapi.json",
 )
 
-# ---------------------------------------------------------------------
-# CORS — baca dari ENV, fallback ke defaults
-# Set ALLOWED_ORIGINS di Render Dashboard (pisahkan dengan koma):
-#   https://nama-project.vercel.app,http://localhost:3000
-# ---------------------------------------------------------------------
-_origins_env = os.environ.get("ALLOWED_ORIGINS", "")
-
-ALLOWED_ORIGINS: list[str] = [
-    origin.strip()
-    for origin in _origins_env.split(",")
-    if origin.strip()
-] or [
-    # Default untuk development lokal
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:5173",
-]
-
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# Set ALLOWED_ORIGINS di Render Dashboard (pisah koma):
+#   https://nama-app.vercel.app,http://localhost:3000
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,   # Wajib True agar browser kirim cookie + Authorization header
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Session-ID"],  # Expose custom header ke FE jika dibutuhkan
+    allow_origins     = settings.cors_origins,
+    allow_credentials = True,
+    allow_methods     = ["*"],
+    allow_headers     = ["*"],
 )
 
-# ---------------------------------------------------------------------
-# Routers
-# ---------------------------------------------------------------------
+# ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(targets.router)
 app.include_router(scan.router)
-app.include_router(sessions.router)
-app.include_router(methods.router)
 app.include_router(results.router)
 app.include_router(report.router)
 app.include_router(ai_config.router)
 
 
+# ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/", tags=["Health"])
 def root():
-    return {
-        "status":  "ok",
-        "version": "1.0.0",
-        "message": "Security Automation API",
-    }
+    return {"status": "ok", "version": "2.0.0"}
 
 
 @app.get("/health", tags=["Health"])

@@ -1,51 +1,156 @@
-from fastapi import APIRouter, HTTPException
-from app.core.supabase import get_supabase
-from app.services.ai_service import generate_ai_report_summary, get_usage_stats
+"""
+app/routers/report.py
+---------------------
+Generate laporan scan dalam format Markdown.
+Opsional: analisis AI untuk triage dan rekomendasi.
+"""
 
-router = APIRouter()
+from __future__ import annotations
+
+from datetime import datetime
+
+from fastapi import APIRouter, HTTPException
+
+from app.core.auth import CurrentUser
+from app.core.supabase import get_supabase
+
+router = APIRouter(prefix="/api/report", tags=["Report"])
 
 
 @router.get("/{session_id}")
-async def generate_report(session_id: str, use_ai: bool = True):
+def generate_report(
+    session_id: str,
+    user:       CurrentUser,
+    use_ai:     bool = True,
+):
     """
-    Generate laporan hasil scan.
-
-    use_ai=True  → AI buat ringkasan naratif (data sensitif otomatis di-strip sebelum dikirim)
-    use_ai=False → Laporan struktural tanpa AI, semua data asli tersedia untuk review internal
+    Generate laporan lengkap untuk satu scan session.
+    use_ai=true → tambahkan analisis AI triage.
     """
-    db = get_supabase()
+    sb = get_supabase()
 
-    session = db.table("scan_session").select("*, target(nama, base_url, jenis)").eq("id", session_id).single().execute()
-    if not session.data:
-        raise HTTPException(404, "Session tidak ditemukan")
+    # Verifikasi kepemilikan dan ambil session
+    session_res = (
+        sb.table("scan_session")
+        .select("*, target(nama, base_url, jenis)")
+        .eq("id", session_id)
+        .eq("user_id", user.user_id)
+        .maybe_single()
+        .execute()
+    )
+    if not session_res.data:
+        raise HTTPException(status_code=404, detail="Session tidak ditemukan.")
 
-    results = db.table("test_result").select("*").eq("session_id", session_id).execute()
+    session = session_res.data
+    if session["status"] not in ("completed", "failed"):
+        raise HTTPException(status_code=400, detail="Scan belum selesai.")
 
-    # Grouping per severity — data LENGKAP untuk laporan internal
-    by_severity: dict = {}
-    for r in results.data:
-        sev = r.get("severity") or "unknown"
-        by_severity.setdefault(sev, []).append(r.get("finding", ""))
+    # Ambil semua hasil
+    results_res = (
+        sb.table("test_result")
+        .select(
+            "status, severity, finding, created_at, "
+            "hack_methods(nama, domain_kategori, risk_level), "
+            "target_endpoint(path, method)"
+        )
+        .eq("session_id", session_id)
+        .order("created_at")
+        .execute()
+    )
+    rows = results_res.data
 
-    report = {
-        "session_id": session_id,
-        "target": session.data.get("target", {}),
-        "status": session.data.get("status"),
-        "started_at": session.data.get("started_at"),
-        "finished_at": session.data.get("finished_at"),
-        "findings_by_severity": by_severity,   # data lengkap — hanya untuk internal
-        "total_findings": len(results.data),
-        "ai_summary": None,
-        "data_privacy_note": (
-            "Data sensitif (IP, URL, token, credential) tidak dikirim ke AI. "
-            "AI hanya menerima pola vulnerability untuk triage."
-        ),
+    # Hitung statistik
+    stats    = {"total": len(rows), "pass": 0, "fail": 0, "error": 0, "skipped": 0}
+    severity = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+    findings = []
+
+    for r in rows:
+        stats[r["status"]] = stats.get(r["status"], 0) + 1
+        if r["status"] == "fail" and r.get("severity"):
+            severity[r["severity"]] = severity.get(r["severity"], 0) + 1
+            findings.append({
+                "method":   (r.get("hack_methods") or {}).get("nama", "-"),
+                "severity": r["severity"],
+                "finding":  r["finding"],
+            })
+
+    # Build Markdown report
+    target   = session.get("target") or {}
+    now      = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    md_lines = [
+        f"# Security Scan Report",
+        f"",
+        f"**Target**: {target.get('nama', '-')} — `{target.get('base_url', '-')}`",
+        f"**Jenis**: {target.get('jenis', '-')}",
+        f"**Session**: `{session_id}`",
+        f"**Status**: {session['status']}",
+        f"**Mulai**: {session.get('started_at', '-')}",
+        f"**Selesai**: {session.get('finished_at', '-')}",
+        f"**Dibuat**: {now}",
+        f"",
+        f"---",
+        f"",
+        f"## Ringkasan",
+        f"",
+        f"| Metrik | Nilai |",
+        f"|--------|-------|",
+        f"| Total test | {stats['total']} |",
+        f"| Pass | {stats['pass']} |",
+        f"| Fail (vulnerability) | {stats['fail']} |",
+        f"| Error | {stats['error']} |",
+        f"| Skipped | {stats['skipped']} |",
+        f"",
+        f"### Distribusi Severity",
+        f"",
+        f"| Severity | Jumlah |",
+        f"|----------|--------|",
+    ]
+    for sev in ["critical", "high", "medium", "low", "info"]:
+        md_lines.append(f"| {sev.capitalize()} | {severity[sev]} |")
+
+    if findings:
+        md_lines += [
+            f"",
+            f"---",
+            f"",
+            f"## Temuan Vulnerability ({len(findings)})",
+            f"",
+        ]
+        for i, f in enumerate(findings, 1):
+            md_lines += [
+                f"### {i}. [{f['severity'].upper()}] {f['method']}",
+                f"",
+                f"{f['finding']}",
+                f"",
+            ]
+
+    # AI triage (opsional)
+    ai_analysis = None
+    if use_ai and findings:
+        try:
+            from app.services.ai_service import run_triage
+            ai_analysis = run_triage(session_id)
+            md_lines += [
+                f"---",
+                f"",
+                f"## Analisis AI",
+                f"",
+                ai_analysis,
+                f"",
+            ]
+        except Exception as e:
+            md_lines += [f"", f"*AI triage tidak tersedia: {e}*", f""]
+
+    report_md = "\n".join(md_lines)
+
+    return {
+        "message": "Laporan berhasil dibuat.",
+        "data": {
+            "session_id":   session_id,
+            "stats":        stats,
+            "severity":     severity,
+            "findings":     findings,
+            "report_md":    report_md,
+            "ai_analysis":  ai_analysis,
+        }
     }
-
-    if use_ai and results.data:
-        target_info = session.data.get("target", {})
-        # generate_ai_report_summary sudah sanitasi otomatis di dalam
-        report["ai_summary"] = await generate_ai_report_summary(target_info, by_severity)
-        report["ai_usage"] = get_usage_stats()
-
-    return report

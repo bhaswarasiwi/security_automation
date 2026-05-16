@@ -1,92 +1,97 @@
+"""
+app/routers/ai_config.py
+------------------------
+Ganti AI provider secara runtime tanpa restart server.
+Switch provider: admin only.
+Usage stats dan test: semua authenticated user.
+"""
+
+from __future__ import annotations
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Literal, Optional
-from app.core.config import settings
-from app.services.ai_service import get_usage_stats, reset_usage, call_ai
 
-router = APIRouter()
+from app.core.auth import CurrentUser, require_admin
+from app.services.ai_service import (
+    AIConfig, get_ai_config, get_usage_stats,
+    reset_usage_stats, set_ai_config, test_ai_connection,
+)
 
-
-class SwitchProviderRequest(BaseModel):
-    provider: Literal["gemini", "claude", "openai", "ollama"]
-    api_key: Optional[str] = None
-    model: Optional[str] = None
-    base_url: Optional[str] = None
+router = APIRouter(prefix="/api/ai", tags=["AI Config"])
 
 
-@router.get("/provider")
-def get_current_provider():
+class SwitchRequest(BaseModel):
+    provider:  str               # gemini | claude | openai | ollama
+    api_key:   str | None = None
+    base_url:  str | None = None
+    model:     str | None = None
+    max_tokens: int = 1000
+
+
+@router.get("/config")
+def get_config(user: CurrentUser):
+    """Cek konfigurasi AI provider aktif saat ini."""
+    cfg = get_ai_config()
     return {
-        "provider": settings.ai_provider,
-        "gemini_model": settings.gemini_model,
-        "claude_model": settings.claude_model,
-        "openai_model": settings.openai_model,
-        "openai_base_url": settings.openai_base_url,
-        "ollama_model": settings.ollama_model,
-        "ollama_base_url": settings.ollama_base_url,
-        "ai_max_tokens": settings.ai_max_tokens,
-        "ai_max_findings_per_call": settings.ai_max_findings_per_call,
+        "message": "OK",
+        "data": {
+            "provider":   cfg.provider,
+            "model":      cfg.model,
+            "max_tokens": cfg.max_tokens,
+            # Jangan expose api_key
+        }
     }
 
 
 @router.post("/switch")
-def switch_provider(body: SwitchProviderRequest):
+def switch_provider(body: SwitchRequest, user: CurrentUser):
     """
-    Ganti AI provider secara runtime tanpa restart.
-
-    Contoh pindah ke akun kantor/klien:
-    - OpenAI kantor: provider=openai, api_key=..., base_url=https://ai.kantor.com/v1
-    - Gemini gratis: provider=gemini, api_key=AIza...
-    - Offline: provider=ollama
+    Ganti AI provider runtime (tanpa restart server).
+    Admin only.
     """
-    settings.ai_provider = body.provider
+    require_admin(user)
 
-    if body.provider == "gemini":
-        if body.api_key: settings.gemini_api_key = body.api_key
-        if body.model:   settings.gemini_model = body.model
+    valid_providers = {"gemini", "claude", "openai", "ollama"}
+    if body.provider not in valid_providers:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Provider tidak valid. Pilihan: {valid_providers}",
+        )
 
-    if body.provider == "claude":
-        if body.api_key: settings.anthropic_api_key = body.api_key
-        if body.model:   settings.claude_model = body.model
+    new_config = AIConfig(
+        provider   = body.provider,
+        api_key    = body.api_key,
+        base_url   = body.base_url,
+        model      = body.model,
+        max_tokens = body.max_tokens,
+    )
+    set_ai_config(new_config)
 
-    if body.provider == "openai":
-        if body.api_key:  settings.openai_api_key = body.api_key
-        if body.model:    settings.openai_model = body.model
-        if body.base_url: settings.openai_base_url = body.base_url
-
-    if body.provider == "ollama":
-        if body.base_url: settings.ollama_base_url = body.base_url
-        if body.model:    settings.ollama_model = body.model
-
-    return {"message": f"Provider berhasil diganti ke: {body.provider}", "provider": settings.ai_provider}
-
-
-@router.get("/usage")
-def ai_usage():
-    stats = get_usage_stats()
-    limits = {
-        "gemini": "1.500 request/hari, 1 juta token/menit (gratis)",
-        "claude": "Sesuai kredit Anthropic",
-        "openai": "Sesuai kredit OpenAI",
-        "ollama": "Tidak terbatas (lokal)",
-    }
     return {
-        **stats,
-        "limit_info": limits.get(settings.ai_provider, "-"),
-        "tip": "Jika limit habis, switch ke ollama: POST /api/ai/switch {provider: 'ollama'}",
+        "message": f"AI provider berhasil diganti ke '{body.provider}'.",
+        "data":    {"provider": body.provider, "model": body.model},
     }
-
-
-@router.post("/usage/reset")
-def reset_ai_usage():
-    reset_usage()
-    return {"message": "Usage counter direset"}
 
 
 @router.post("/test")
-async def test_ai(prompt: str = "Jawab singkat: 1+1 berapa?"):
+def test_connection(user: CurrentUser, prompt: str = "Halo, tes koneksi AI."):
+    """Test koneksi ke AI provider aktif."""
     try:
-        result = await call_ai(prompt)
-        return {"provider": settings.ai_provider, "response": result, "status": "ok"}
+        response = test_ai_connection(prompt)
+        return {"message": "Koneksi AI berhasil.", "data": {"response": response}}
     except Exception as e:
-        raise HTTPException(500, f"AI gagal: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"AI tidak dapat dihubungi: {e}")
+
+
+@router.get("/usage")
+def usage_stats(user: CurrentUser):
+    """Pantau penggunaan token AI di sesi ini."""
+    return {"message": "OK", "data": get_usage_stats()}
+
+
+@router.post("/usage/reset")
+def reset_usage(user: CurrentUser):
+    """Reset counter penggunaan token. Admin only."""
+    require_admin(user)
+    reset_usage_stats()
+    return {"message": "Usage counter direset.", "data": get_usage_stats()}
